@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+log() { printf '[remote] %s\n' "$*" >&2; }
+is_deleted() { case "$1" in *[!0]*) return 1 ;; *) return 0 ;; esac; }
+
+if ! git remote get-url origin >/dev/null 2>&1; then
+    log 'remote origin not config!'
+    exit 0
+fi
+
+while read -r old_commit new_commit ref; do
+    is_deleted "$new_commit" && continue
+    case "$ref" in
+        refs/heads/*) branch=${ref#refs/heads/} ;;
+        *) continue ;;
+    esac
+
+    # An absent branch is allowed; authentication/network failures are not.
+    if git ls-remote --exit-code --heads origin "$ref" >/dev/null; then
+        :
+    else
+        status=$?
+        if [ "$status" -eq 2 ]; then
+            continue
+        fi
+        log "cannot query origin/$branch (git ls-remote exited $status)"
+        exit 1
+    fi
+
+    # Receive hooks run in quarantine. Fetch objects without updating refs;
+    # FETCH_HEAD contains the exact remote tip used for this check.
+    if ! git fetch --no-tags --refmap= origin "$ref"; then
+        log "cannot fetch origin/$branch"
+        exit 1
+    fi
+    if ! remote_commit=$(git rev-parse --verify 'FETCH_HEAD^{commit}'); then
+        log "cannot resolve fetched commit for origin/$branch"
+        exit 1
+    fi
+    if git merge-base --is-ancestor "$remote_commit" "$new_commit"; then
+        :
+    else
+        status=$?
+        if [ "$status" -eq 1 ]; then
+            log "origin/$branch cannot fast-forward to $new_commit: remote tip $remote_commit is not an ancestor"
+        else
+            log "cannot check fast-forward for origin/$branch (git merge-base exited $status)"
+        fi
+        exit 1
+    fi
+done
