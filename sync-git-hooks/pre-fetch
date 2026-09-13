@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Refresh prefix-matching origin branches, then atomically fast-forward public refs.
+
+Requires Python 3 and Git. Install as an executable pre-fetch hook in the bare
+repository. origin must be an administrator-configured upstream Git remote.
+RPSY dry-run still synchronizes the server; only the client is read-only.
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def git(*args, input=None, allowed=(0,)):
+    result = subprocess.run(
+        ["git", *args], input=input, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode not in allowed:
+        # Git transport diagnostics can contain upstream URLs or credentials.
+        fail("git " + args[0] + " failed; check the server origin configuration")
+    return result
+
+
+def main():
+    if len(sys.argv) != 1:
+        fail("pre-fetch does not accept arguments")
+    if os.environ.get("RPSY_PROTOCOL") != "3":
+        fail("requires RPSY_PROTOCOL=3")
+    if os.environ.get("RPSY_OPERATION") not in ("fetch", "ls-remote"):
+        fail("requires an RPSY fetch/ls-remote session")
+    prefixes = json.loads(os.environ.get("RPSY_REF_PREFIXES_JSON", "null"))
+    if (not isinstance(prefixes, list) or not 1 <= len(prefixes) <= 256
+            or any(not isinstance(p, str) or not p.startswith("refs/heads/")
+                   or any(ord(c) < 32 or ord(c) == 127 for c in p)
+                   for p in prefixes)):
+        fail("invalid ref prefixes")
+    prefixes = sorted(set(prefixes))
+    if sum(len(p.encode("utf-8")) for p in prefixes) > 32768:
+        fail("ref prefixes exceed 32 KiB")
+    for prefix in prefixes:
+        git("check-ref-format", prefix + "rpsy-prefix")
+    if git("rev-parse", "--is-bare-repository").stdout.strip() != "true":
+        fail("requires a bare repository")
+    git("remote", "get-url", "origin")
+
+    # Prefixes can denote entire namespaces or partial components, not exact names.
+    listing = git("ls-remote", "--heads", "origin").stdout
+    branches = set()
+    for line in listing.splitlines():
+        _, name = line.split("\t", 1)
+        if name.startswith("refs/heads/") and any(name.startswith(p) for p in prefixes):
+            git("check-ref-format", name)
+            branches.add(name)
+    if not branches:
+        return
+
+    checked_out = {
+        line[len("branch "): ]
+        for line in git("worktree", "list", "--porcelain").stdout.splitlines()
+        if line.startswith("branch ")
+    }
+    commands = ["start"]
+    messages = []
+    for name in sorted(branches):
+        branch = name[len("refs/heads/"): ]
+        if name in checked_out:
+            fail("branch is checked out in a worktree: " + branch)
+        tracking = "refs/remotes/origin/" + branch
+        # Explicit destination works even when a bare origin has no fetch refspec.
+        # Force refreshes only the tracking ref; public branches remain FF-only.
+        git("fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
+            "--refmap=", "origin", "+" + name + ":" + tracking)
+        remote = git("rev-parse", "--verify", tracking + "^{commit}").stdout.strip()
+        existing = git("rev-parse", "--verify", "--quiet", name, allowed=(0, 1))
+        old = existing.stdout.strip()
+        if not old:
+            commands.append("create " + name + " " + remote)
+            messages.append("created " + branch)
+        else:
+            git("cat-file", "-e", old + "^{commit}")
+            if git("merge-base", "--is-ancestor", old, remote, allowed=(0, 1)).returncode == 0:
+                commands.append("update " + name + " " + remote + " " + old)
+                messages.append("fast-forward " + branch if old != remote else "unchanged " + branch)
+            elif git("merge-base", "--is-ancestor", remote, old, allowed=(0, 1)).returncode == 0:
+                commands.append("verify " + name + " " + old)
+                messages.append("already ahead " + branch)
+            else:
+                fail("branches diverged; cannot fast-forward " + branch)
+    # No public branch changes until every branch has passed the FF checks.
+    commands.extend(["prepare", "commit"])
+    git("update-ref", "--stdin", input="\n".join(commands) + "\n")
+    for message in messages:
+        print("[pre-fetch] " + message, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, OSError) as error:
+        print("[pre-fetch] " + str(error), file=sys.stderr)
+        sys.exit(1)
