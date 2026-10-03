@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tarfile
 import time
+import urllib.error
 import urllib.request
 
 
@@ -35,16 +37,66 @@ def package_templates(source):
     return base64.b64encode(output.getvalue()).decode('ascii')
 
 
+class GitHubAPIError(RuntimeError):
+    """A failed API request with bounded, credential-free diagnostics."""
+
+
+def describe_api_error(req, error, token):
+    details = {
+        'method': req.get_method(),
+        'url': req.full_url,
+        'status': error.code,
+    }
+    if error.geturl() != req.full_url:
+        details['response_url'] = error.geturl()
+    try:
+        body = json.loads(error.read(16384))
+    except (ValueError, OSError):
+        body = None
+    finally:
+        error.close()
+    if isinstance(body, dict) and isinstance(body.get('message'), str):
+        details['message'] = body['message'][:2000]
+        # Validation errors may contain submitted values; only include field identifiers.
+        if isinstance(body.get('errors'), list):
+            details['errors'] = [
+                {key: item[key][:200] for key in ('resource', 'field', 'code')
+                 if isinstance(item.get(key), str)}
+                for item in body['errors'][:10] if isinstance(item, dict)
+            ]
+    else:
+        details['message'] = 'GitHub returned an empty, non-JSON or unreadable error response'
+    for header, name in (
+        ('X-GitHub-Request-Id', 'request_id'),
+        ('X-Accepted-GitHub-Permissions', 'required_permissions'),
+        ('X-OAuth-Scopes', 'token_scopes'),
+        ('X-Accepted-OAuth-Scopes', 'accepted_scopes'),
+    ):
+        if error.headers.get(header):
+            details[name] = error.headers[header][:1000]
+    if error.headers.get('X-GitHub-SSO'):
+        # Keep the SSO requirement, not the authorization URL or its query parameters.
+        details['sso'] = error.headers['X-GitHub-SSO'].split(';', 1)[0][:200]
+    text = json.dumps(details, ensure_ascii=True)
+    if token:
+        text = text.replace(json.dumps(token, ensure_ascii=True)[1:-1], '[REDACTED]')
+    return re.sub(r'\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)', '[REDACTED]', text)
+
+
 def request(repository, endpoint, payload=None):
+    token = os.environ['GH_TOKEN']
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f'https://api.github.com/repos/{repository}/actions' + endpoint, data=data, headers={
-        'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+        'Authorization': 'Bearer ' + token,
         'Accept': 'application/vnd.github+json',
         'Content-Type': 'application/json',
         'X-GitHub-Api-Version': '2026-03-10',
     })
-    with urllib.request.urlopen(req, timeout=30) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise GitHubAPIError('GitHub API request failed: ' + describe_api_error(req, error, token)) from None
 
 
 def wait_for_run(repository, run_id, timeout=3600):
@@ -95,6 +147,10 @@ def main(argv=None):
         inputs['templates_archive'] = package_templates(args.templates_dir)
     if len(json.dumps(inputs)) > 65535:
         raise ValueError('Dispatch inputs exceed 65,535 characters')
+    # Read with the exact CI credential before attempting a deployment.
+    workflow = request(args.repo, f'/workflows/{args.workflow}')
+    print(f"Helm workflow accessible: {args.repo}/{args.workflow}; "
+          f"id={workflow.get('id')}; state={workflow.get('state')}", flush=True)
     # Do not retry POST: an uncertain response may already have queued a deployment.
     result = request(args.repo, f'/workflows/{args.workflow}/dispatches', {'ref': args.ref, 'inputs': inputs})
     run_id = result.get('workflow_run_id')
@@ -109,4 +165,8 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except GitHubAPIError as error:
+        print(error, file=sys.stderr, flush=True)
+        sys.exit(1)
