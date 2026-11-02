@@ -117,11 +117,28 @@ def parse_args(argv=None):
     parser.add_argument('--repo', required=True, help='Target GitHub repository: owner/repository')
     parser.add_argument('--workflow', default='deploy.yml', help='Target workflow filename')
     parser.add_argument('--ref', default='main', help='Target Git ref')
-    parser.add_argument('--image-info', default='', help='Optional <file>=<repository>:<tag>')
+    parser.add_argument('--image-info', default='', help='Optional <file>=<repository>[:<tag>]@sha256:<digest>; legacy tags are resolved by Helm')
     parser.add_argument('--project', default='', help='Template directory owner in Helm')
     parser.add_argument('--templates-dir', type=Path, help='Local template directory; omit to leave templates unchanged')
     parser.add_argument('--timeout', type=int, default=3600, help='Maximum wait in seconds')
     args = parser.parse_args(argv)
+    if args.image_info:
+        name, separator, reference = args.image_info.partition('=')
+        if not separator or not re.fullmatch(r'[a-z0-9][a-z0-9-]*', name):
+            parser.error('--image-info must start with a valid file identifier followed by =')
+        image, at, digest = reference.partition('@')
+        if at and not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+            parser.error('--image-info requires a complete sha256 digest')
+        repository = image
+        tag = None
+        if ':' in image.rsplit('/', 1)[-1]:
+            repository, _, tag = image.rpartition(':')
+        if (not re.fullmatch(r'[a-z0-9][a-z0-9._:/-]*', repository)
+                or any(part in ('', '.', '..') for part in repository.split('/'))
+                or ':' in repository.rsplit('/', 1)[-1]
+                or (tag is not None and not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', tag))
+                or (not at and tag is None)):
+            parser.error('--image-info must contain a valid repository and explicit digest or legacy tag')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+', args.repo) or args.repo.split('/')[1] in ('.', '..'):
         parser.error('--repo must be owner/repository')
     if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*\.ya?ml', args.workflow):
