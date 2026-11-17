@@ -13,6 +13,70 @@ import urllib.error
 import urllib.request
 
 
+# This standalone script is downloaded without sibling modules. Keep the image
+# validator aligned with helm/scripts/image_updates.py and its documented contract.
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def reject_constant(value):
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def parse_image_updates(encoded):
+    if len(encoded) > 65535:
+        raise ValueError("image_updates exceeds 65,535 characters")
+    updates = json.loads(encoded, object_pairs_hook=unique_object,
+                         parse_constant=reject_constant)
+    if not isinstance(updates, list) or not 1 <= len(updates) <= 100:
+        raise ValueError("image_updates must be a JSON array of 1 to 100 objects")
+    targets = []
+    for index, update in enumerate(updates):
+        label = f"image_updates[{index}]"
+        required = {'file', 'path', 'repository', 'digest'}
+        if (not isinstance(update, dict) or not required <= update.keys()
+                or update.keys() - (required | {'tag'})):
+            raise ValueError(f"{label} requires file, path, repository and digest; only tag is optional")
+        name = update['file']
+        if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]*', name):
+            raise ValueError(f"{label}.file must be a lowercase file identifier")
+        path = update['path']
+        if (not isinstance(path, list) or not 1 <= len(path) <= 32
+                or any(not isinstance(key, str) or not re.fullmatch(
+                    r'[A-Za-z_][A-Za-z0-9_-]{0,127}', key) for key in path)):
+            raise ValueError(f"{label}.path requires 1 to 32 literal mapping keys (letters, digits, _ and -)")
+        repository = update['repository']
+        if not isinstance(repository, str) or not 1 <= len(repository) <= 255:
+            raise ValueError(f"{label}.repository must be a string of 1 to 255 characters")
+        parts = repository.split('/')
+        if ':' in parts[0] and len(parts) > 1:
+            host, separator, port = parts.pop(0).partition(':')
+            if (not separator or not re.fullmatch(r'[a-z0-9]+(?:[.-][a-z0-9]+)*', host)
+                    or not re.fullmatch(r'[0-9]{1,5}', port) or not 1 <= int(port) <= 65535):
+                raise ValueError(f"{label}.repository has an invalid registry host or port")
+        if any(not re.fullmatch(r'[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*', part)
+               for part in parts):
+            raise ValueError(f"{label}.repository must be a lowercase repository without a tag or digest")
+        if (not isinstance(update['digest'], str)
+                or not re.fullmatch(r'sha256:[0-9a-f]{64}', update['digest'])):
+            raise ValueError(f"{label}.digest requires sha256 and 64 lowercase hexadecimal characters")
+        if 'tag' in update and (not isinstance(update['tag'], str) or not re.fullmatch(
+                r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', update['tag'])):
+            raise ValueError(f"{label}.tag is invalid")
+        target = tuple(path)
+        for other_name, other_path in targets:
+            common = min(len(target), len(other_path))
+            if name == other_name and target[:common] == other_path[:common]:
+                raise ValueError(f"{label} duplicates or overlaps another image target")
+        targets.append((name, target))
+    return updates
+
+
 def package_templates(source):
     if not source.is_dir() or source.is_symlink():
         raise ValueError('helm-template must be a regular directory')
@@ -106,7 +170,7 @@ def wait_for_run(repository, run_id, timeout=3600):
         if run['status'] == 'completed':
             if run['conclusion'] != 'success':
                 raise RuntimeError(f"Helm Action concluded: {run['conclusion']}")
-            print('Helm Action succeeded (asynchronous deployment request submitted)', flush=True)
+            print('Helm Action succeeded; check its summary for synchronization and deployment status', flush=True)
             return
         time.sleep(10)
     raise TimeoutError('Timed out waiting for Helm Action; check its run URL before retrying')
@@ -118,10 +182,13 @@ def parse_args(argv=None):
     parser.add_argument('--workflow', default='deploy.yml', help='Target workflow filename')
     parser.add_argument('--ref', default='main', help='Target Git ref')
     parser.add_argument('--image-info', default='', help='Optional <file>=<repository>[:<tag>]@sha256:<digest>; legacy tags are resolved by Helm')
+    parser.add_argument('--image-updates-file', type=Path, help='JSON file of digest-only image updates; mutually exclusive with --image-info')
     parser.add_argument('--project', default='', help='Template directory owner in Helm')
     parser.add_argument('--templates-dir', type=Path, help='Local template directory; omit to leave templates unchanged')
     parser.add_argument('--timeout', type=int, default=3600, help='Maximum wait in seconds')
     args = parser.parse_args(argv)
+    if args.image_info and args.image_updates_file is not None:
+        parser.error('--image-info and --image-updates-file are mutually exclusive')
     if args.image_info:
         name, separator, reference = args.image_info.partition('=')
         if not separator or not re.fullmatch(r'[a-z0-9][a-z0-9-]*', name):
@@ -154,9 +221,13 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    inputs = {}
+    if args.image_updates_file is not None:
+        with args.image_updates_file.open(encoding='utf-8') as source:
+            updates = parse_image_updates(source.read(65536))
+        inputs['image_updates'] = json.dumps(updates, separators=(',', ':'))
     if not os.environ.get('GH_TOKEN'):
         raise ValueError('GH_TOKEN environment variable is required')
-    inputs = {}
     if args.image_info:
         inputs['image_info'] = args.image_info
     if args.templates_dir is not None:
