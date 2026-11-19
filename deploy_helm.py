@@ -104,6 +104,10 @@ def package_templates(source):
 class GitHubAPIError(RuntimeError):
     """A failed API request with bounded, credential-free diagnostics."""
 
+    def __init__(self, message, *, status):
+        super().__init__(message)
+        self.status = status
+
 
 def describe_api_error(req, error, token):
     details = {
@@ -160,19 +164,42 @@ def request(repository, endpoint, payload=None):
         with urllib.request.urlopen(req, timeout=30) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        raise GitHubAPIError('GitHub API request failed: ' + describe_api_error(req, error, token)) from None
+        raise GitHubAPIError(
+            'GitHub API request failed: ' + describe_api_error(req, error, token), status=error.code,
+        ) from None
 
 
 def wait_for_run(repository, run_id, timeout=3600):
     deadline = time.monotonic() + timeout
+    poll_interval = 10
+    retries_left = 2
+    run_found = False
+    last_lookup_error = None
     while time.monotonic() < deadline:
-        run = request(repository, f'/runs/{run_id}')
-        if run['status'] == 'completed':
-            if run['conclusion'] != 'success':
-                raise RuntimeError(f"Helm Action concluded: {run['conclusion']}")
-            print('Helm Action succeeded; check its summary for synchronization and deployment status', flush=True)
-            return
-        time.sleep(10)
+        try:
+            run = request(repository, f'/runs/{run_id}')
+        except GitHubAPIError as error:
+            if run_found or error.status != 404:
+                raise
+            last_lookup_error = error
+            if retries_left == 0 or time.monotonic() + poll_interval >= deadline:
+                break
+            retries_left -= 1
+        else:
+            run_found = True
+            last_lookup_error = None
+            if run['status'] == 'completed':
+                if run['conclusion'] != 'success':
+                    raise RuntimeError(f"Helm Action concluded: {run['conclusion']}")
+                print('Helm Action succeeded; check its summary for synchronization and deployment status', flush=True)
+                return
+        time.sleep(poll_interval)
+    if last_lookup_error is not None:
+        run_url = f'https://github.com/{repository}/actions/runs/{run_id}'
+        raise GitHubAPIError(
+            f'Helm Action was dispatched, but its result could not be confirmed. See {run_url}\n{last_lookup_error}',
+            status=last_lookup_error.status,
+        ) from None
     raise TimeoutError('Timed out waiting for Helm Action; check its run URL before retrying')
 
 

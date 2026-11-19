@@ -38,7 +38,10 @@ Helm 仓库 `PROJECT_HELM_ACTION_GUIDE.md` 的“单次发布多个镜像”一�
 读取 workflow 失败时不会触发部署；读取成功后 POST 失败可进一步判断触发权限或输入问题。
 这些检查使用 CI 中实际保存的 Token；其他设备上 GitHub CLI 登录成功不能代替此项验证。
 
-脚本等待 dispatch 返回的准确 workflow run ID，Action 成功时提示查看该运行的 summary。
+脚本等待 dispatch 返回的准确 workflow run ID。首次读到运行前，查询返回 404 时等待 10 秒再查同一个 ID，
+最多查询 3 次（含首次），重试计入 `--timeout`。如果仍未读到运行，脚本以非零状态退出，输出运行链接和
+最后一次 API 错误，提示 Helm workflow 已触发、执行结果未确认。读到运行后继续等待其最终结论，
+Action 成功时提示查看该运行的 summary。
 部署暂停时成功仅代表同步和 Chart 校验完成；未暂停时成功仅代表提交了异步部署请求，
 均不表示集群升级或认证行为验收完成。
 
